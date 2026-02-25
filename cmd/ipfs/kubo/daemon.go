@@ -44,8 +44,10 @@ import (
 	prometheus "github.com/prometheus/client_golang/prometheus"
 	promauto "github.com/prometheus/client_golang/prometheus/promauto"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	promexporter "go.opentelemetry.io/otel/exporters/prometheus"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/exemplar"
 )
 
 const (
@@ -181,8 +183,8 @@ Headers.
 		cmds.BoolOption(enableGCKwd, "Enable automatic periodic repo garbage collection"),
 		cmds.BoolOption(adjustFDLimitKwd, "Check and raise file descriptor limits if needed").WithDefault(true),
 		cmds.BoolOption(migrateKwd, "If true, assume yes at the migrate prompt. If false, assume no."),
-		cmds.BoolOption(enablePubSubKwd, "DEPRECATED"),
-		cmds.BoolOption(enableIPNSPubSubKwd, "Enable IPNS over pubsub. Implicitly enables pubsub, overrides Ipns.UsePubsub config."),
+		cmds.BoolOption(enablePubSubKwd, "DEPRECATED CLI flag. Use Pubsub.Enabled config instead."),
+		cmds.BoolOption(enableIPNSPubSubKwd, "DEPRECATED CLI flag. Use Ipns.UsePubsub config instead."),
 		cmds.BoolOption(enableMultiplexKwd, "DEPRECATED"),
 		cmds.StringOption(agentVersionSuffix, "Optional suffix to the AgentVersion presented by `ipfs id` and exposed via libp2p identify protocol."),
 
@@ -224,6 +226,28 @@ func daemonFunc(req *cmds.Request, re cmds.ResponseEmitter, env cmds.Environment
 		log.Errorf("Creating prometheus exporter for OpenTelemetry failed: %s (some metrics will be missing from /debug/metrics/prometheus)\n", err.Error())
 	} else {
 		meterProvider := sdkmetric.NewMeterProvider(
+			// Drop high-cardinality server.address attribute from http.server.*
+			// metrics. otelhttp derives it from the Host header, which causes
+			// cardinality explosion on subdomain gateways where each
+			// CID.ipfs.example.com hostname is a unique label value.
+			// Per-domain visibility is provided by the lower-cardinality
+			// server.domain attribute added in core/corehttp/gateway.go.
+			sdkmetric.WithView(sdkmetric.NewView(
+				sdkmetric.Instrument{Name: "http.server.*"},
+				sdkmetric.Stream{
+					AttributeFilter: attribute.NewDenyKeysFilter(
+						attribute.Key("server.address"),
+					),
+				},
+			)),
+			// Disable exemplars. The OTel spec requires exemplars to carry
+			// attributes filtered out by Views (as FilteredAttributes).
+			// The server.address value on subdomain gateways (e.g.
+			// "CID.ipfs.dweb.link") combined with trace_id and span_id
+			// exceeds the 128-rune Prometheus exemplar limit.
+			// Re-enabling exemplars requires removing all metrics that
+			// track server.address (the above View is not enough).
+			sdkmetric.WithExemplarFilter(exemplar.AlwaysOffFilter),
 			sdkmetric.WithReader(exporter),
 		)
 		otel.SetMeterProvider(meterProvider)
@@ -397,10 +421,14 @@ func daemonFunc(req *cmds.Request, re cmds.ResponseEmitter, env cmds.Environment
 
 	fmt.Printf("PeerID: %s\n", cfg.Identity.PeerID)
 
-	if !psSet {
+	if psSet {
+		log.Error("The --enable-pubsub-experiment flag is deprecated. Use Pubsub.Enabled config option instead.")
+	} else {
 		pubsub = cfg.Pubsub.Enabled.WithDefault(false)
 	}
-	if !ipnsPsSet {
+	if ipnsPsSet {
+		log.Error("The --enable-namesys-pubsub flag is deprecated. Use Ipns.UsePubsub config option instead.")
+	} else {
 		ipnsps = cfg.Ipns.UsePubsub.WithDefault(false)
 	}
 
@@ -883,21 +911,36 @@ func serveHTTPApi(req *cmds.Request, cctx *oldcmds.Context) (<-chan error, error
 		return nil, fmt.Errorf("serveHTTPApi: ConstructNode() failed: %s", err)
 	}
 
+	// Buffer channel to prevent deadlock when multiple servers write errors simultaneously
+	errc := make(chan error, len(listeners))
+	var wg sync.WaitGroup
+
+	// Start all servers and wait for them to be ready before writing api file.
+	// This prevents race conditions where external tools (like systemd path units)
+	// see the file and try to connect before servers can accept connections.
 	if len(listeners) > 0 {
-		// Only add an api file if the API is running.
+		readyChannels := make([]chan struct{}, len(listeners))
+		for i, lis := range listeners {
+			readyChannels[i] = make(chan struct{})
+			ready := readyChannels[i]
+			wg.Go(func() {
+				errc <- corehttp.ServeWithReady(node, manet.NetListener(lis), ready, opts...)
+			})
+		}
+
+		// Wait for all listeners to be ready or any to fail
+		for _, ready := range readyChannels {
+			select {
+			case <-ready:
+				// This listener is ready
+			case err := <-errc:
+				return nil, fmt.Errorf("serveHTTPApi: %w", err)
+			}
+		}
+
 		if err := node.Repo.SetAPIAddr(rewriteMaddrToUseLocalhostIfItsAny(listeners[0].Multiaddr())); err != nil {
 			return nil, fmt.Errorf("serveHTTPApi: SetAPIAddr() failed: %w", err)
 		}
-	}
-
-	errc := make(chan error)
-	var wg sync.WaitGroup
-	for _, apiLis := range listeners {
-		wg.Add(1)
-		go func(lis manet.Listener) {
-			defer wg.Done()
-			errc <- corehttp.Serve(node, manet.NetListener(lis), opts...)
-		}(apiLis)
 	}
 
 	go func() {
@@ -1058,24 +1101,40 @@ func serveHTTPGateway(req *cmds.Request, cctx *oldcmds.Context) (<-chan error, e
 		return nil, fmt.Errorf("serveHTTPGateway: ConstructNode() failed: %s", err)
 	}
 
+	// Buffer channel to prevent deadlock when multiple servers write errors simultaneously
+	errc := make(chan error, len(listeners))
+	var wg sync.WaitGroup
+
+	// Start all servers and wait for them to be ready before writing gateway file.
+	// This prevents race conditions where external tools (like systemd path units)
+	// see the file and try to connect before servers can accept connections.
 	if len(listeners) > 0 {
+		readyChannels := make([]chan struct{}, len(listeners))
+		for i, lis := range listeners {
+			readyChannels[i] = make(chan struct{})
+			ready := readyChannels[i]
+			wg.Go(func() {
+				errc <- corehttp.ServeWithReady(node, manet.NetListener(lis), ready, opts...)
+			})
+		}
+
+		// Wait for all listeners to be ready or any to fail
+		for _, ready := range readyChannels {
+			select {
+			case <-ready:
+				// This listener is ready
+			case err := <-errc:
+				return nil, fmt.Errorf("serveHTTPGateway: %w", err)
+			}
+		}
+
 		addr, err := manet.ToNetAddr(rewriteMaddrToUseLocalhostIfItsAny(listeners[0].Multiaddr()))
 		if err != nil {
-			return nil, fmt.Errorf("serveHTTPGateway: manet.ToIP() failed: %w", err)
+			return nil, fmt.Errorf("serveHTTPGateway: manet.ToNetAddr() failed: %w", err)
 		}
 		if err := node.Repo.SetGatewayAddr(addr); err != nil {
 			return nil, fmt.Errorf("serveHTTPGateway: SetGatewayAddr() failed: %w", err)
 		}
-	}
-
-	errc := make(chan error)
-	var wg sync.WaitGroup
-	for _, lis := range listeners {
-		wg.Add(1)
-		go func(lis manet.Listener) {
-			defer wg.Done()
-			errc <- corehttp.Serve(node, manet.NetListener(lis), opts...)
-		}(lis)
 	}
 
 	go func() {
@@ -1252,7 +1311,7 @@ func merge(cs ...<-chan error) <-chan error {
 
 func YesNoPrompt(prompt string) bool {
 	var s string
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		fmt.Printf("%s ", prompt)
 		_, err := fmt.Scanf("%s", &s)
 		if err != nil {
